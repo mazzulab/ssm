@@ -111,6 +111,7 @@ class SLDS(object):
             poisson_id=emssn.PoissonIdentityEmissions,
             poisson_nn=emssn.PoissonNeuralNetworkEmissions,
             bernoulli=emssn.BernoulliEmissions,
+            bernoulli_noinput=emssn.BernoulliEmissionsNoInput, # added this class to avoid input
             bernoulli_orthog=emssn.BernoulliOrthogonalEmissions,
             bernoulli_id=emssn.BernoulliIdentityEmissions,
             bernoulli_nn=emssn.BernoulliNeuralNetworkEmissions,
@@ -877,6 +878,7 @@ class LDS(SLDS):
             poisson_id=emssn.PoissonIdentityEmissions,
             poisson_nn=emssn.PoissonNeuralNetworkEmissions,
             bernoulli=emssn.BernoulliEmissions,
+            bernoulli_noinput=emssn.BernoulliEmissionsNoInput, # added this class to avoid input
             bernoulli_orthog=emssn.BernoulliOrthogonalEmissions,
             bernoulli_id=emssn.BernoulliIdentityEmissions,
             bernoulli_nn=emssn.BernoulliNeuralNetworkEmissions,
