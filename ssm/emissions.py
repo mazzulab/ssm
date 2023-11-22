@@ -336,7 +336,7 @@ class _NeuralNetworkEmissions(Emissions):
         super(_NeuralNetworkEmissions, self).__init__(N, K, D, M=M, single_subspace=True)
 
         # Initialize the neural network weights
-        assert N > D
+        # assert N > D
         layer_sizes = (D + M,) + hidden_layer_sizes + (N,)
         self.weights = [npr.randn(m, n) for m, n in zip(layer_sizes[:-1], layer_sizes[1:])]
         self.biases = [npr.randn(n) for n in layer_sizes[1:]]
@@ -363,6 +363,7 @@ class _NeuralNetworkEmissions(Emissions):
         """
         Inverse is... who knows!
         """
+        assert data.shape[1] == self.N
         return npr.randn(data.shape[0], self.D)
 
 
