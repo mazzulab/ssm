@@ -102,6 +102,7 @@ class HMM(object):
             robust_autoregressive=obs.RobustAutoRegressiveObservations,
             diagonal_robust_ar=obs.RobustAutoRegressiveDiagonalNoiseObservations,
             diagonal_robust_autoregressive=obs.RobustAutoRegressiveDiagonalNoiseObservations,
+            input_driven_obs_gaussian=obs.InputDrivenGaussianObservations
             )
 
         if isinstance(observations, str):
@@ -109,7 +110,6 @@ class HMM(object):
             if observations not in observation_classes:
                 raise Exception("Invalid observation model: {}. Must be one of {}".
                     format(observations, list(observation_classes.keys())))
-
             observation_kwargs = observation_kwargs or {}
             observations = \
                 hier.HierarchicalObservations(observation_classes[observations], K, D, M=M,
@@ -117,9 +117,19 @@ class HMM(object):
                                         **observation_kwargs) \
                 if hierarchical_observation_tags is not None \
                 else observation_classes[observations](K, D, M=M, **observation_kwargs)
-        if not isinstance(observations, obs.Observations):
-            raise TypeError("'observations' must be a subclass of"
-                            " ssm.observations.Observations")
+
+        if hierarchical_observation_tags is not None:
+            if not isinstance(observations.parent, obs.Observations):
+                raise TypeError("'parent observations' must be a subclass of"
+                                " ssm.observations.Observations")
+            for tag in hierarchical_observation_tags:
+                if not isinstance(observations.children[tag], obs.Observations):
+                    raise TypeError("'child observations' must be a subclass of"
+                                    " ssm.observations.Observations")
+        else:
+            if not isinstance(observations, obs.Observations):
+                raise TypeError("'observations' must be a subclass of"
+                                " ssm.observations.Observations")
 
         self.K, self.D, self.M = K, D, M
         self.init_state_distn = init_state_distn
@@ -202,6 +212,8 @@ class HMM(object):
         # Get the type of the observations
         if isinstance(self.observations, obs.InputDrivenObservations):
             dtype = int
+        elif isinstance(self.observations, obs.InputDrivenGaussianObservations):
+            dtype =  float
         else:
             dummy_data = self.observations.sample_x(0, np.empty(0, ) + D)
             dtype = dummy_data.dtype

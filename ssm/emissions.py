@@ -99,6 +99,11 @@ class Emissions(object):
 
 
 # Many emissions models start with a linear layer
+
+# CHANGES: to eliminate input dependence replace 
+# Go through LinearEmissions or also Emissions and other observations and make sure that all the functions that .dot input, they take input[:, :self.M] 
+# Because self.M is set to 0 by default in the other classes that call LinearEmissions and Emissions.
+
 class _LinearEmissions(Emissions):
     """
     A simple linear mapping from continuous states x to data y.
@@ -155,8 +160,12 @@ class _LinearEmissions(Emissions):
         C_pseudoinv = np.linalg.solve(C.T.dot(C), C.T).T
 
         # Account for the bias
-        bias = input.dot(F.T) + d
-
+#     THIS IS THE ORIGINAL def
+#         bias = input.dot(F.T) + d
+#     REPLACED WITH THE FOLLOWING TO ELIMINATE INPUT DEPENDENCE because when called from other classes
+#       it will take self.M and if the other class has default self.M=0 it will ignore input  
+        bias = input[:, :self.M].dot(F.T) + d        
+        
         if not np.all(mask):
             data = interpolate_data(data, mask)
             # We would like to find the PCA coordinates in the face of missing data
@@ -168,10 +177,19 @@ class _LinearEmissions(Emissions):
         # Project data to get the mean
         return (data - bias).dot(C_pseudoinv)
 
+#     THIS IS THE ORIGINAL def
+#     def forward(self, x, input, tag):
+#         return np.matmul(self.Cs[None, ...], x[:, None, :, None])[:, :, :, 0] \
+#             + np.matmul(self.Fs[None, ...], input[:, None, :, None])[:, :, :, 0] \
+#             + self.ds
+#     REPLACED WITH THE FOLLOWING TO ELIMINATE INPUT DEPENDENCE because when called from other classes
+#       it will take self.M and if the other class has default self.M=0 it will ignore input  
+
     def forward(self, x, input, tag):
         return np.matmul(self.Cs[None, ...], x[:, None, :, None])[:, :, :, 0] \
-            + np.matmul(self.Fs[None, ...], input[:, None, :, None])[:, :, :, 0] \
+            + np.matmul(self.Fs[None, ...], input[:, None, :self.M, None])[:, :, :, 0] \
             + self.ds
+    
 
     @ensure_args_are_lists
     def _initialize_with_pca(self, datas, inputs=None, masks=None, tags=None, num_iters=20):
@@ -184,8 +202,13 @@ class _LinearEmissions(Emissions):
             lr.fit(np.vstack(inputs), np.vstack(datas))
             self.Fs = np.tile(lr.coef_[None, :, :], (Keff, 1, 1))
 
-        # Compute residual after accounting for input
-        resids = [data - np.dot(input, self.Fs[0].T) for data, input in zip(datas, inputs)]
+#         Compute residual after accounting for input
+#     THIS IS THE ORIGINAL def
+#         resids = [data - np.dot(input, self.Fs[0].T) for data, input in zip(datas, inputs)]
+#     REPLACED WITH THE FOLLOWING TO ELIMINATE INPUT DEPENDENCE because when called from other classes
+#       it will take self.M and if the other class has default self.M=0 it will ignore input  
+        resids = [data - np.dot(input[:, :self.M], self.Fs[0].T)
+                  for data, input in zip(datas, inputs)]
 
         # Run PCA to get a linear embedding of the data with the maximum effective dimension
         pca, xs, ll = pca_with_imputation(min(self.D * Keff, self.N),
@@ -608,6 +631,26 @@ class BernoulliEmissions(_BernoulliEmissionsMixin, _LinearEmissions):
         hess = np.einsum('tn, ni, nj ->tij', -dp_dpsi, self.Cs[0], self.Cs[0])
         return -1 * hess
 
+    
+# NEW CLASSES FOR BernoulliEmissions without input dependence
+# BEGIN NEW CLASSES
+
+class _LinearEmissionsNoInput(_LinearEmissions):
+    """
+    A simple linear mapping from continuous states x to data y.
+    *Without the input dependence*
+        E[y | x] = Cx + d
+    where C is an emission matrix and d is a bias.
+    """
+    def __init__(self, N, K, D, M=0, single_subspace=True):
+        super(_LinearEmissionsNoInput, self).\
+            __init__(N, K, D, M=0, single_subspace=single_subspace)
+
+
+class BernoulliEmissionsNoInput(_LinearEmissionsNoInput, BernoulliEmissions):
+    pass
+
+# END NEW CLASSES                           
 
 class BernoulliOrthogonalEmissions(_BernoulliEmissionsMixin, _OrthogonalLinearEmissions):
     @ensure_args_are_lists

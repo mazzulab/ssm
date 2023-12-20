@@ -26,8 +26,9 @@ class _Hierarchical(object):
         self.tags = tags
         self.children = dict()
         for tag in tags:
-            ch = self.children[tag] = base_class(*args, **kwargs)
-            ch.params = tuple(prm + np.sqrt(lmbda) * npr.randn(*prm.shape) for prm in self.parent.params)
+            self.children[tag] = base_class(*args, **kwargs)
+            # ch = self.children[tag] = base_class(*args, **kwargs)
+            # ch.params = tuple(prm + np.sqrt(lmbda) * npr.randn(*prm.shape) for prm in self.parent.params)
 
     @property
     def params(self):
@@ -48,10 +49,11 @@ class _Hierarchical(object):
             self.children[tag].permute(perm)
 
     @ensure_args_are_lists
-    def initialize(self, datas, inputs=None, masks=None, tags=None):
-        self.parent.initialize(datas, inputs=inputs, masks=masks, tags=tags)
+    def initialize(self, datas, inputs=None, masks=None, tags=None, init_method="random"):
+        self.parent.initialize(datas, inputs=inputs, masks=masks, tags=tags, init_method=init_method)
         for tag in self.tags:
-            self.children[tag].params = copy.deepcopy(self.parent.params)
+            self.children[tag].params = tuple(prm + np.sqrt(self.lmbda) * npr.randn(*prm.shape) for prm in self.parent.params)
+            # self.children[tag].params = copy.deepcopy(self.parent.params)
 
     def log_prior(self):
         lp = self.parent.log_prior()
@@ -73,7 +75,7 @@ class _Hierarchical(object):
         # expected log joint
         def _expected_log_joint(expectations):
             elbo = self.log_prior()
-            for data, input, mask, tag, (expected_states, expected_joints) \
+            for data, input, mask, tag, (expected_states, expected_joints, _) \
                 in zip(datas, inputs, masks, tags, expectations):
 
                 if hasattr(self.children[tag], 'log_initial_state_distn'):
@@ -112,6 +114,25 @@ class HierarchicalTransitions(_Hierarchical):
 
 
 class HierarchicalObservations(_Hierarchical):
+    def __init__(self, base_class, K, D, M, *args, tags=(None,), lmbda=0.01, **kwargs):
+        # Variance of child params around parent params
+        self.lmbda = lmbda
+#         self.C = C
+        self.M = M
+        self.K = K
+        self.D = D
+
+        # Top-level parameters (parent)
+        self.parent = base_class(K, D, M, *args, **kwargs)
+
+        # Make models for each tag
+        self.tags = tags
+        self.children = dict()
+        for tag in tags:
+            self.children[tag] = base_class(K, D, M, *args, **kwargs)
+            # ch = self.children[tag] = base_class(K, D, M, *args, **kwargs)
+            # ch.params = tuple(prm + np.sqrt(lmbda) * npr.randn(*prm.shape) for prm in self.parent.params)
+
     def log_likelihoods(self, data, input, mask, tag):
         return self.children[tag].log_likelihoods(data, input, mask, tag)
 
