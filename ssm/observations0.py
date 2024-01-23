@@ -624,7 +624,7 @@ class CategoricalObservations(Observations):
         Compute the mean observation under the posterior distribution
         of latent discrete states.
         """
-        raise NotImplementedError        
+        raise NotImplementedError
 
 class InputDrivenObservations(Observations):
 
@@ -691,7 +691,7 @@ class InputDrivenObservations(Observations):
         return stats.categorical_logpdf(data[:, None, :], time_dependent_logits[:, :, None, :], mask=mask[:, None, :])
 
     def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
-        assert self.D == 1, "SoftmaxObservations written for D = 1!"
+        assert self.D == 1, "InputDrivenObservations written for D = 1!"
         if input.ndim == 1 and input.shape == (self.M,): # if input is vector of size self.M (one time point), expand dims to be (1, M)
             input = np.expand_dims(input, axis=0)
         time_dependent_logits = self.calculate_logits(input)  # size TxKxC
@@ -704,7 +704,113 @@ class InputDrivenObservations(Observations):
         return sample
 
     def m_step(self, expectations, datas, inputs, masks, tags, optimizer = "bfgs", **kwargs):
-        Observations.m_step(self, expectations, datas, inputs, masks, tags, optimizer, **kwargs)
+
+        T = sum([data.shape[0] for data in datas]) #total number of datapoints
+
+        def _multisoftplus(X):
+            '''
+            computes f(X) = log(1+sum(exp(X), axis =1)) and its first derivative
+            :param X: array of size Tx(C-1)
+            :return f(X) of size T and df of size (Tx(C-1))
+            '''
+            X_augmented = np.append(X, np.zeros((X.shape[0], 1)), 1) # append a column of zeros to X for rowmax calculation
+            rowmax = np.max(X_augmented, axis = 1, keepdims=1) #get max along column for log-sum-exp trick, rowmax is size T
+            # compute f:
+            f = np.log(np.exp(-rowmax[:,0]) + np.sum(np.exp(X - rowmax), axis = 1)) + rowmax[:,0]
+            # compute df
+            df = np.exp(X - rowmax)/np.expand_dims((np.exp(-rowmax[:,0]) + np.sum(np.exp(X - rowmax), axis = 1)), axis = 1)
+            return f, df
+
+        def _objective(params, k):
+            '''
+            computes term in negative expected complete loglikelihood that depends on weights for state k
+            :param params: vector of size (C-1)xM
+            :return term in negative expected complete LL that depends on weights for state k; scalar value
+            '''
+            W = np.reshape(params, (self.C - 1, self.M))
+            obj = 0
+            for data, input, mask, tag, (expected_states, _, _) \
+                    in zip(datas, inputs, masks, tags, expectations):
+                xproj = input @ W.T  # projection of input onto weight matrix for particular state, size is Tx(C-1)
+                f, _ = _multisoftplus(xproj)
+                assert data.shape[1] == 1, "InputDrivenObservations written for D = 1!"
+                data_one_hot = one_hot(data[:, 0], self.C)  # convert to one-hot representation of size TxC
+                temp_obj = (-np.sum(data_one_hot[:,:-1]*xproj, axis = 1) + f)@expected_states[:,k]
+                obj += temp_obj
+
+            # add contribution of prior:
+            if self.prior_sigma != 0:
+                obj += 1/(2*self.prior_sigma**2)*np.sum(W**2)
+            return obj / T
+
+        def _gradient(params, k):
+            '''
+            Explicit calculation of gradient of _objective w.r.t weight matrix for state k, W_{k}
+            :param params: vector of size (C-1)xM
+            :param k: state whose parameters we are currently optimizing
+            :return gradient of objective with respect to parameters; vector of size (C-1)xM
+            '''
+            W = np.reshape(params, (self.C-1, self.M))
+            grad = np.zeros((self.C-1, self.M))
+            for data, input, mask, tag, (expected_states, _, _) \
+                    in zip(datas, inputs, masks, tags, expectations):
+                xproj = input@W.T #projection of input onto weight matrix for particular state, size is Tx(C-1)
+                _, df = _multisoftplus(xproj)
+                assert data.shape[1] == 1, "InputDrivenObservations written for D = 1!"
+                data_one_hot = one_hot(data[:, 0], self.C) #convert to one-hot representation of size TxC
+                grad  += (df - data_one_hot[:,:-1]).T@(expected_states[:, [k]]*input) #gradient is shape (C-1,M)
+            # Add contribution to gradient from prior:
+            if self.prior_sigma != 0:
+                grad += (1/(self.prior_sigma)**2)*W
+            # Now flatten grad into a vector:
+            grad = grad.flatten()
+            return grad/T
+
+        def _hess(params, k):
+            '''
+            Explicit calculation of hessian of _objective w.r.t weight matrix for state k, W_{k}
+            :param params: vector of size (C-1)xM
+            :param k: state whose parameters we are currently optimizing
+            :return hessian of objective with respect to parameters; matrix of size ((C-1)xM) x ((C-1)xM)
+            '''
+            W = np.reshape(params, (self.C - 1, self.M))
+            hess = np.zeros(((self.C - 1)*self.M, (self.C - 1)*self.M))
+            for data, input, mask, tag, (expected_states, _, _) \
+                    in zip(datas, inputs, masks, tags, expectations):
+                xproj = input @ W.T  # projection of input onto weight matrix for particular state
+                _, df = _multisoftplus(xproj)
+                # center blocks:
+                dftensor = np.expand_dims(df, axis = 2) # dims are now (T,  (C-1), 1)
+                Xdf = np.expand_dims(input, axis = 1) * dftensor # multiply every input covariate term with every class derivative term for a given time step; dims are now (T, (C-1), M)
+                # reshape Xdf to (T, (C-1)*M)
+                Xdf = np.reshape(Xdf, (Xdf.shape[0], -1))
+                # weight Xdf by posterior state probabilities
+                pXdf = expected_states[:, [k]]*Xdf # output is size (T, (C-1)*M)
+                # outer product with input vector, size (M, (C-1)*M)
+                XXdf = input.T @ pXdf
+                # center blocks of hessian:
+                temp_hess = np.zeros(((self.C - 1) * self.M, (self.C - 1) * self.M))
+                for c in range(1, self.C):
+                    inds = range((c - 1)*self.M,c*self.M)
+                    temp_hess[np.ix_(inds, inds)] = XXdf[:, inds]
+                # off diagonal entries:
+                hess += temp_hess - Xdf.T@pXdf
+            # add contribution of prior to hessian
+            if self.prior_sigma != 0:
+                hess += (1 / (self.prior_sigma) ** 2)
+            return hess/T
+
+        from scipy.optimize import minimize
+        # Optimize weights for each state separately:
+        for k in range(self.K):
+            def _objective_k(params):
+                return _objective(params, k)
+            def _gradient_k(params):
+                return _gradient(params, k)
+            def _hess_k(params):
+                return _hess(params, k)
+            sol = minimize(_objective_k, self.params[k].reshape(((self.C-1) * self.M)), hess=_hess_k, jac=_gradient_k, method="trust-ncg")
+            self.params[k] = np.reshape(sol.x, (self.C-1, self.M))
 
     def smooth(self, expectations, data, input, tag):
         """
@@ -712,156 +818,6 @@ class InputDrivenObservations(Observations):
         of latent discrete states.
         """
         raise NotImplementedError
-
-        
-        
-        
-# NEW CLASS FOR GAUSSIAN GLM
-
-class InputDrivenGaussianObservations(Observations):
-
-    def __init__(self, K, D, M=0, w_prior_mean = 0, w_prior_sigma=1000,  mu_prior_mean = 0, mu_prior_sigma=1000):
-        """
-        @param K: number of states
-        @param D: dimensionality of output
-        @param prior_sigma: parameter governing strength of prior. Prior on GLM weights is multivariate
-        normal distribution with mean 'prior_mean' and diagonal covariance matrix (prior_sigma is on diagonal)
-        """
-        super(InputDrivenGaussianObservations, self).__init__(K, D, M)
-#         self.C = C
-        self.M = M
-        self.D = D
-        self.K = K
-        self.w_prior_mean = w_prior_mean
-        self.w_prior_sigma = w_prior_sigma
-        self.mu_prior_mean = mu_prior_mean
-        self.mu_prior_sigma = mu_prior_sigma
-
-        self.mus = npr.randn(K, D)
-        self._sqrt_Sigmas = npr.randn(K, D, D)
-        # Parameters linking input to distribution over output classes
-        self.Wks = npr.randn(K, D, M)
-
-    # ALLOW TO SET THE PARAMETERS BY HAND - this part is adapted from the AutoregressiveGaussian obs
-    
-    
-    @property
-    def Wk(self):
-        return self.Wks[0]
-
-    @Wk.setter
-    def Wk(self, value):
-        assert value.shape == self.Wks[0].shape
-        self.Wks[0] = value
-
-    @property
-    def mu(self):
-        return self.mus[0]
-
-    @mu.setter
-    def mu(self, value):
-        assert value.shape == self.mus[0].shape
-        self.mus[0] = value
-    
-    @property
-    def Sigmas(self):
-        return np.matmul(self._sqrt_Sigmas, np.swapaxes(self._sqrt_Sigmas, -1, -2))
-
-    @Sigmas.setter
-    def Sigmas(self, value):
-        assert value.shape == (self.K, self.D, self.D)
-        self._sqrt_Sigmas = np.linalg.cholesky(value + 1e-8 * np.eye(self.D))
-    
-    @property
-    def params(self):
-        return self.Wks, self.mus, self._sqrt_Sigmas
-
-    @params.setter
-    def params(self, value):
-        self.Wks, self.mus, self._sqrt_Sigmas = value
-
-    def permute(self, perm):
-        self.Wks = self.Wks[perm]
-        self.mus = self.mus[perm]
-        self._sqrt_Sigmas = self._sqrt_Sigmas[perm]
-        
-#     def log_prior(self):
-#         lp = 0
-#         for k in range(self.K):#for each state
-# #             for c in range(self.C - 1):
-# #                 weights = self.Wk[k][c]
-#             for c in range(self.D):#for each observation dimension
-#                 weights = self.Wks[k][c]#will be a vector of size M
-#                 mus = self.mus[k][c]#will be a scalar
-#                 #add a log prior on the weights..
-#                 lp += stats.multivariate_normal_logpdf(weights,mus=np.repeat(self.w_prior_mean, (self.M)),Sigmas=((self.w_prior_sigma) ** 2) * np.identity(self.M))
-#                 #add a log prior on the mus..
-#                 lp += stats.multivariate_normal_logpdf(np.array([mus]), mus=np.repeat(self.mu_prior_mean, (1)),Sigmas=((self.mu_prior_sigma) ** 2) * np.identity(1))
-#         return lp
-
-    # Calculate time dependent log prob - output is matrix of size TxKxD
-    # Input is size TxM
-    def calculate_input(self, input):
-        """
-        Return array of size TxKxD containing log(pr(yt|zt=k))
-        :param input: input array of covariates of size TxM
-        :return: array of size TxKxD containing log(pr(yt|zt=k, ut)) for all c in {1, ..., D} and k in {1, ..., K}
-        """
-        ## REWRITE TO KEEP TIME AS FIRST DIMENSION!
-        Wk=self.Wks
-        time_dependent_input =np.transpose(np.dot(Wk, input.T), (2, 0, 1)) # dim TxKxD
-        #Note: this has an unexpected effect when both input (and thus Wk) are empty arrays and returns an array of zeros
-        return time_dependent_input
-    
-    
-    # log_likelihoods for multivariate gaussian
-    def log_likelihoods(self, data, input, mask, tag):
-        mus, Sigmas = self.mus, self.Sigmas # dimensions: (K,D), (K,D,D)
-        if input.ndim == 1 and input.shape == (self.M,): # if input is vector of size self.M (one time point), expand dims to be (1, M)
-            input = np.expand_dims(input, axis=0)
-        time_dependent_input = self.calculate_input(input) # dimensions: TxKxD
-        # data: dimensions (T,D)
-        if mask is not None and np.any(~mask) and not isinstance(mus, np.ndarray):
-            raise Exception("Current implementation of multivariate_normal_logpdf for masked data"
-                            "does not work with autograd because it writes to an array. "
-                            "Use DiagonalGaussian instead if you need to support missing data.")
-        # stats.multivariate_normal_logpdf supports broadcasting, but we get
-        # significant performance benefit if we call it with (TxD), (D,), and (D,D)
-        # arrays as inputs
-        # data shape is TxD
-        time_dependent_input=np.transpose(time_dependent_input,(1,0,2)) # transpose this to dim KxTxD to match with data and use it in zip 
-        return np.column_stack([stats.multivariate_normal_logpdf(data-time_input, mu, Sigma)
-                               for mu, Sigma, time_input in zip(mus, Sigmas, time_dependent_input)])
-
-    def sample_x(self, z, xhist, input, tag=None, with_noise=True):
-                               # z is an T-dim array of state indices
-        D, mus = self.D, self.mus
-        if input.ndim == 1 and input.shape == (self.M,): # if input is vector of size self.M (one time point), expand dims to be (1, M)
-            input = np.expand_dims(input, axis=0)
-        time_dependent_input = self.calculate_input(input)  # size TxKxD
-        # LINE BELOW: the last dimension in time_dependent_input is the time; 
-        # when running "# fit the data array" in hmm.py, it picks only input[0] 
-        T = time_dependent_input.shape[0]
-        sqrt_Sigmas = self._sqrt_Sigmas if with_noise else np.zeros((self.K, self.D, self.D))  
-        if T == 1:
-            sample = np.array([mus[z] + time_dependent_input[t,z,:] + np.dot(sqrt_Sigmas[z], npr.randn(D)) for t in range(T)])
-        elif T > 1:
-            sample = np.array([mus[z[t]] + time_dependent_input[t,z[t],:] + np.dot(sqrt_Sigmas[z[t]], npr.randn(D)) for t in range(T)])                               
-        return sample    
-    
-    def m_step(self, expectations, datas, inputs, masks, tags, optimizer = "bfgs", **kwargs):
-        Observations.m_step(self, expectations, datas, inputs, masks, tags, optimizer, **kwargs)
-
-    def smooth(self, expectations, data, input, tag):
-        """
-        Compute the mean observation under the posterior distribution
-        of latent discrete states.
-        """
-        raise NotImplementedError
-        
-# END NEW CLASS
-
-
 
 
 class _AutoRegressiveObservationsBase(Observations):

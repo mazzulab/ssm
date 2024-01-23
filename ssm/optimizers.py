@@ -13,7 +13,7 @@ import autograd.numpy as np
 from autograd.misc import flatten
 from autograd.wrap_util import wraps
 
-from scipy.optimize import minimize
+from scipy.optimize import minimize, Bounds
 from ssm.primitives import solve_symm_block_tridiag
 
 def convex_combination(curr, target, alpha):
@@ -102,6 +102,7 @@ def _generic_sgd(method, loss, x0, callback=None, num_iters=200, state=None, ful
 
 
 def _generic_minimize(method, loss, x0,
+                      bounds=None,  # Added parameter for bounds
                       verbose=False,
                       num_iters=1000,
                       tol=1e-4,
@@ -114,7 +115,19 @@ def _generic_minimize(method, loss, x0,
     """
     # Flatten the loss
     _x0, unflatten = flatten(x0)
+    # _x0 = _x0 + np.random.normal(loc=0.0, scale=0.1, size=len(_x0))
     _objective = lambda x_flat, itr: loss(unflatten(x_flat), itr)
+    # Flatten the bounds (if any)
+    if bounds is not None:
+        #unzip the bounds to flatten
+        lb = [b[0] for b in bounds]
+        ub = [b[1] for b in bounds]
+        lb_ = [b if not np.isnan(b) else None for b in flatten(lb)[0]]
+        ub_ = [b if not np.isnan(b) else None for b in flatten(ub)[0]]
+        bounds_ = Bounds(lb=lb_, ub=ub_, keep_feasible=True)
+
+    else:
+        bounds_ = None
 
     if verbose:
         print("Fitting with {}.".format(method))
@@ -135,6 +148,7 @@ def _generic_minimize(method, loss, x0,
     result = minimize(_objective, _x0, args=(-1,),
                       jac=safe_grad,
                       method=method,
+                      bounds=bounds_,  # Pass bounds to minimize
                       callback=callback if verbose else None,
                       options=dict(maxiter=num_iters, disp=verbose),
                       tol=tol,
@@ -156,7 +170,6 @@ rmsprop = partial(_generic_sgd, "rmsprop")
 adam = partial(_generic_sgd, "adam")
 bfgs = partial(_generic_minimize, "BFGS")
 lbfgs = partial(_generic_minimize, "L-BFGS-B")
-
 
 # Special optimizer for function with block-tridiagonal hessian
 def newtons_method_block_tridiag_hessian(
@@ -218,3 +231,39 @@ def backtracking_line_search(x0, dx, obj, g, stepsize = 1.0, min_stepsize=1e-8,
             break
 
     return stepsize
+
+def unflatten_optimizer(optimize):
+    """Takes an optimizer that operates on flat 1D numpy arrays and returns a
+    wrapped version that handles trees of nested containers (lists/tuples/dicts)
+    with arrays/scalars at the leaves."""
+    @wraps(optimize)
+    def _optimize(grad, x0, callback=None, *args, **kwargs):
+        _x0, unflatten = flatten(x0)
+        _grad = lambda x, i: flatten(grad(unflatten(x), i))[0]
+        if callback:
+            _callback = lambda x, i, g: callback(unflatten(x), i, unflatten(g))
+        else:
+            _callback = None
+        return unflatten(optimize(_grad, _x0, _callback, *args, **kwargs))
+
+    return _optimize
+
+@unflatten_optimizer
+def adamc(grad, x, callback=None, num_iters=100,
+         step_size=0.001, b1=0.9, b2=0.999, eps=10**-8):
+    """Adam as described in http://arxiv.org/pdf/1412.6980.pdf.
+    It's basically RMSprop with momentum and some correction terms."""
+    m = np.zeros(len(x))
+    v = np.zeros(len(x))
+    for i in range(num_iters):
+        g = grad(x, i)
+        if callback: callback(x, i, g)
+        m = (1 - b1) * g      + b1 * m  # First  moment estimate.
+        v = (1 - b2) * (g**2) + b2 * v  # Second moment estimate.
+        mhat = m / (1 - b1**(i + 1))    # Bias correction.
+        vhat = v / (1 - b2**(i + 1))
+        x = x - step_size*mhat/(np.sqrt(vhat) + eps)
+        #clip x to be positive
+        x = np.clip(x, 1E-3, None)
+
+    return x
